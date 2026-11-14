@@ -67,6 +67,20 @@ def test_underrun_returns_silence_and_reprimes():
     assert r.pull(1024)[0] == 0.5
 
 
+def test_partial_underrun_keeps_playing():
+    """A short hiccup costs one small gap, not a full re-prime silence."""
+    r = AudioReservoir(FS, prebuffer_s=0.05)
+    r.write(np.full(3000, 0.5, np.float32))
+    assert r.pull(1024)[0] == 0.5          # primed and playing
+    assert r.pull(1024)[0] == 0.5          # buf: 3000 -> 1976 -> 952
+    out = r.pull(1024)                     # partial: 952 real + 72 zeros
+    assert out[0] == 0.5 and out[-1] == 0
+    assert r.underruns == 1
+    # still primed: the next small write plays immediately
+    r.write(np.full(512, 0.5, np.float32))
+    assert r.pull(1024)[0] == 0.5
+
+
 def test_latency_is_bounded():
     """A producer that runs far ahead drops the oldest audio, not the newest."""
     r = AudioReservoir(FS, prebuffer_s=0.05, max_buffer_s=0.2)

@@ -46,7 +46,8 @@ class AudioReservoir:
     costs one dropout instead of a sustained choppy cycle.
     """
 
-    PREBUFFER_S = 0.15   # playback starts at this fill level
+    PREBUFFER_S = 0.30   # playback starts at this fill level; also the
+                         # jitter tolerance for bursty chunk production
     MAX_BUFFER_S = 1.0   # bound latency; older audio is dropped beyond this
 
     def __init__(self, fs: float,
@@ -84,15 +85,16 @@ class AudioReservoir:
                 self._primed = True
             n = min(frames, len(self._buf))
             if n == 0:
-                # underrun: wait for a fresh prebuffer before resuming
+                # fully drained: wait for a fresh prebuffer before resuming
                 self._primed = False
                 self.underruns += 1
                 return out
             out[:n] = self._buf[:n]
             self._buf = self._buf[n:]
             if n < frames:
-                # partial frame: drop out and re-prime (audio has a gap)
-                self._primed = False
+                # partial frame: play what is there; the next burst is at
+                # most one chunk away, so keep playing (no re-prime) -
+                # re-priming would turn every hiccup into a long gap
                 self.underruns += 1
         return out
 
@@ -115,10 +117,16 @@ class AudioMonitor:
             def callback(outdata, frames, time_info, status):
                 outdata[:, 0] = self.reservoir.pull(frames)
 
-            self._stream = sounddevice.OutputStream(
-                samplerate=int(self.fs), channels=1, dtype="float32",
-                blocksize=0,  # let PortAudio pick its native block size
-                callback=callback)
+            try:
+                # 'high' gives the device buffer room to ride out GIL
+                # contention with the GUI (callback delays -> pops otherwise)
+                self._stream = sounddevice.OutputStream(
+                    samplerate=int(self.fs), channels=1, dtype="float32",
+                    blocksize=0, latency="high", callback=callback)
+            except Exception:  # noqa: BLE001 - some devices dislike 'high'
+                self._stream = sounddevice.OutputStream(
+                    samplerate=int(self.fs), channels=1, dtype="float32",
+                    blocksize=0, callback=callback)
             self._stream.start()
             log.info("Audio monitoring enabled")
         except Exception as exc:  # noqa: BLE001 - monitoring is optional
@@ -182,14 +190,14 @@ class PassPipeline(QObject):
                 snr_db=s.sim_snr_db,
                 speed=s.sim_speed,
                 preroll_s=0.0, postroll_s=0.0,
-                fs_iq=240_000.0, chunk_samples=24_000)
+                fs_iq=240_000.0, chunk_samples=12_000)
         if s.source_type == "soundcard":
             return SoundcardSource(fs=48_000.0, chunk_samples=4_800)
         from core.sources.sdr import RtlSdrSource
         center = s.nominal_freq_hz - s.tuning_offset_hz
         gain = "auto" if s.gain_auto else s.manual_gain_db
         return RtlSdrSource(center_freq_hz=center, fs=240_000.0,
-                            chunk_samples=24_000, ppm=s.ppm, gain=gain)
+                            chunk_samples=12_000, ppm=s.ppm, gain=gain)
 
     def _build_chain(self, source: Source) -> Optional[ReceiveChain]:
         """Receive chain for IQ sources; None for already-audio sources."""
