@@ -53,6 +53,9 @@ pyrtlsdr is installed, but no RTL-SDR dongle could be opened:
     then reboot (or: sudo rmmod dvb_usb_rtl28xxu).
 """
 
+# smallest synchronous USB read the fallback ladder will try (samples)
+MIN_READ_SAMPLES = 1024
+
 
 def probe_rtlsdr() -> Tuple[bool, str]:
     """Check the RTL-SDR software stack and hardware, without blocking.
@@ -172,17 +175,38 @@ class RtlSdrSource(TimedSource):
     def _loop(self, sink: Callable[[Chunk], None]) -> None:
         self._open()
         assert self._sdr is not None
+        # macOS's libusb reports LIBUSB_ERROR_OVERFLOW for large
+        # synchronous reads even though the same size works on
+        # Windows/Linux.  Start with the full chunk and shrink the USB
+        # read size until it succeeds; full pipeline chunks are still
+        # emitted regardless of the underlying read granularity.
+        read_size = self.chunk_samples
+        pending = np.zeros(0, dtype=np.complex64)
         while not self._stop_evt.is_set():
             try:
-                samples = self._sdr.read_samples(self.chunk_samples)
+                samples = self._sdr.read_samples(read_size)
             except Exception as exc:  # noqa: BLE001
+                if self._is_overflow(exc) and read_size > MIN_READ_SAMPLES:
+                    read_size = max(MIN_READ_SAMPLES, read_size // 2)
+                    log.warning("RTL-SDR USB overflow; retrying with "
+                                "%d-sample reads", read_size)
+                    time.sleep(0.02)  # let the device buffers drain
+                    continue
                 raise SourceError(f"RTL-SDR read failed: {exc}") from exc
             if samples is None or len(samples) == 0:
                 time.sleep(0.01)
                 continue
-            t = self._stamp()
-            sink(Chunk(data=np.asarray(samples, dtype=np.complex64), t=t,
-                       is_iq=True, fs=self.fs))
+            pending = np.concatenate(
+                [pending, np.asarray(samples, dtype=np.complex64).ravel()])
+            while len(pending) >= self.chunk_samples:
+                t = self._stamp()
+                chunk = pending[:self.chunk_samples]
+                pending = pending[self.chunk_samples:]
+                sink(Chunk(data=chunk, t=t, is_iq=True, fs=self.fs))
+
+    @staticmethod
+    def _is_overflow(exc: Exception) -> bool:
+        return "OVERFLOW" in str(exc).upper()
 
     def _cleanup(self) -> None:
         if self._sdr is not None:

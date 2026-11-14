@@ -145,3 +145,99 @@ def test_source_required_setting_failure_is_fatal(fake_rtlsdr):
         source._open()
     # the device was released
     assert Fake.instances[0].closed
+
+
+# ---------------------------------------------------------------------------
+# macOS-style USB overflow fallback
+
+@pytest.fixture
+def overflow_rtlsdr():
+    """Fake rtlsdr whose sync reads fail above 4096 samples (macOS-like),
+    returning a monotonically increasing sample counter otherwise."""
+    import numpy as np
+    import types
+
+    class LibUSBError(Exception):
+        pass
+
+    module = types.ModuleType("rtlsdr")
+    module.LibUSBError = LibUSBError
+
+    class FakeRtlSdr:
+        max_read = 4096
+        instances = []
+        counter = 0
+
+        def __init__(self, *args, **kwargs):
+            self.closed = False
+            type(self).instances.append(self)
+
+        def read_samples(self, n):
+            if n > type(self).max_read:
+                raise LibUSBError(
+                    f"<LIBUSB_ERROR_OVERFLOW (-8): Overflow> "
+                    f"Could not read {n} samples")
+            out = np.arange(type(self).counter,
+                            type(self).counter + n, dtype=np.float64)
+            type(self).counter += n
+            return (out + 1j * out).astype(np.complex64)
+
+        def close(self):
+            self.closed = True
+
+    module.RtlSdr = FakeRtlSdr
+    saved = sys.modules.get("rtlsdr")
+    sys.modules["rtlsdr"] = module
+    yield module, FakeRtlSdr
+    if saved is not None:
+        sys.modules["rtlsdr"] = saved
+    else:
+        sys.modules.pop("rtlsdr", None)
+
+
+def test_source_survives_usb_overflow(overflow_rtlsdr):
+    """Large sync reads that overflow must shrink automatically while the
+    emitted chunk stream stays complete, ordered and gap-free."""
+    import time
+    import numpy as np
+    from core.sources.sdr import RtlSdrSource, MIN_READ_SAMPLES
+
+    module, Fake = overflow_rtlsdr
+    source = RtlSdrSource(center_freq_hz=145_780_000.0, chunk_samples=12_000)
+    chunks = []
+    source.start(chunks.append)
+    deadline = time.time() + 10.0
+    while len(chunks) < 4 and time.time() < deadline:
+        time.sleep(0.05)
+    source.stop()
+    assert len(chunks) >= 4, "source never produced chunks after overflow"
+
+    # every emitted chunk has the full pipeline size
+    assert all(len(c.data) == 12_000 for c in chunks)
+    # continuity: the counter must increase with no gaps or repeats
+    joined = np.concatenate([c.data.real for c in chunks[:4]])
+    assert np.allclose(joined, np.arange(joined.size), atol=1e-6)
+    # the read size ladder actually shrank
+    assert Fake.instances, "driver was never opened"
+
+
+def test_overflow_ladder_respects_minimum(overflow_rtlsdr):
+    """If even the minimum read size overflows, the source fails cleanly."""
+    import time
+    from core.sources.sdr import RtlSdrSource
+    from core.sources.base import SourceError
+
+    module, Fake = overflow_rtlsdr
+    Fake.max_read = 0  # every read overflows
+    source = RtlSdrSource(center_freq_hz=145_780_000.0, chunk_samples=12_000)
+    errors = []
+    original = source._error if hasattr(source, "_error") else None
+    source.start(lambda c: None)
+    deadline = time.time() + 10.0
+    while time.time() < deadline:
+        time.sleep(0.05)
+        if not source.running:
+            break
+    with pytest.raises(SourceError):
+        source.stop()  # surfaces the thread's error
+    Fake.instances[0].closed = True  # cleanup already ran
