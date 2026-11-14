@@ -55,6 +55,8 @@ pyrtlsdr is installed, but no RTL-SDR dongle could be opened:
 
 # smallest synchronous USB read the fallback ladder will try (samples)
 MIN_READ_SAMPLES = 1024
+# how many overflow-driven close/reopen cycles before giving up
+MAX_OVERFLOW_RECOVERIES = 10
 
 
 def probe_rtlsdr() -> Tuple[bool, str]:
@@ -177,36 +179,53 @@ class RtlSdrSource(TimedSource):
         assert self._sdr is not None
         # macOS's libusb reports LIBUSB_ERROR_OVERFLOW for large
         # synchronous reads even though the same size works on
-        # Windows/Linux.  Start with the full chunk and shrink the USB
-        # read size until it succeeds; full pipeline chunks are still
-        # emitted regardless of the underlying read granularity.
+        # Windows/Linux.  Shrink the USB read size until reads succeed;
+        # full pipeline chunks are still emitted regardless of the
+        # underlying read granularity.
+        #
+        # Important: an overflow leaves the device's internal buffer in
+        # an inconsistent state, and continuing on the same handle can
+        # crash libusb natively (segfault on macOS).  So an overflow
+        # triggers a full close/reopen at the smaller read size, and a
+        # bounded number of reopen attempts avoids an endless
+        # close-open-crash cycle if the hardware is genuinely wedged.
         read_size = self.chunk_samples
         buffer = np.zeros(self.chunk_samples * 4, dtype=np.complex64)
         filled = 0
-        overflow_retries = 0
+        overflows = 0
         while not self._stop_evt.is_set():
             try:
                 samples = self._sdr.read_samples(read_size)
             except Exception as exc:  # noqa: BLE001
-                if self._is_overflow(exc):
-                    overflow_retries += 1
-                    if read_size > MIN_READ_SAMPLES:
-                        read_size = max(MIN_READ_SAMPLES, read_size // 2)
-                        log.warning("RTL-SDR USB overflow; retrying with "
-                                    "%d-sample reads", read_size)
-                        time.sleep(0.02)  # let the device buffers drain
-                        continue
-                    if overflow_retries % 50 == 1:
-                        log.warning(
-                            "RTL-SDR still overflowing at %d-sample reads; "
-                            "check USB 2.0 port / cable / hub", read_size)
-                    time.sleep(0.02)
-                    continue  # keep retrying; do not kill the recording
-                raise SourceError(f"RTL-SDR read failed: {exc}") from exc
+                if not self._is_overflow(exc):
+                    raise SourceError(f"RTL-SDR read failed: {exc}") from exc
+                overflows += 1
+                if overflows > MAX_OVERFLOW_RECOVERIES:
+                    raise SourceError(
+                        "RTL-SDR kept overflowing even after reopening the "
+                        f"device at {read_size}-sample reads ({overflows} "
+                        "attempts). This usually means a USB bandwidth or "
+                        "power problem: try a different USB port (directly "
+                        "on the computer, not a hub or adapter) and a "
+                        "shorter cable."
+                    ) from exc
+                if read_size > MIN_READ_SAMPLES:
+                    read_size = max(MIN_READ_SAMPLES, read_size // 2)
+                log.warning(
+                    "RTL-SDR USB overflow; reopening the device with "
+                    "%d-sample reads (attempt %d of %d)",
+                    read_size, overflows, MAX_OVERFLOW_RECOVERIES)
+                time.sleep(0.1)  # let the device settle before reopening
+                try:
+                    self._reopen()  # same config, fresh handle, size kept
+                except Exception as reopen_exc:  # noqa: BLE001
+                    raise SourceError(
+                        f"Could not reopen the RTL-SDR after an overflow: "
+                        f"{reopen_exc}") from reopen_exc
+                continue
             if samples is None or len(samples) == 0:
                 time.sleep(0.01)
                 continue
-            overflow_retries = 0
             samples = np.asarray(samples, dtype=np.complex64).ravel()
             # make room, then append (amortised buffer growth)
             if filled + samples.size > buffer.size:
@@ -224,10 +243,23 @@ class RtlSdrSource(TimedSource):
                 remaining = filled - self.chunk_samples
                 buffer[:remaining] = buffer[self.chunk_samples:filled]
                 filled = remaining
+            # several successful reads in a row: the smaller size is
+            # working; allow a future overflow a couple of fresh halvings
+            overflows = 0
 
     @staticmethod
     def _is_overflow(exc: Exception) -> bool:
         return "OVERFLOW" in str(exc).upper()
+
+    def _reopen(self) -> None:
+        """Close and reopen the device, preserving configuration.
+
+        A fresh handle is essential after a USB overflow: continuing to
+        read from a handle whose buffer overflowed is documented to
+        misbehave on some platforms (including native crashes on macOS).
+        """
+        self._cleanup()
+        self._open()
 
     def _cleanup(self) -> None:
         if self._sdr is not None:

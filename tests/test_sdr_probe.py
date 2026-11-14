@@ -4,6 +4,7 @@ from __future__ import annotations
 import sys
 import types
 
+import numpy as np
 import pytest
 
 from core.sources.sdr import (RTLSDR_SETUP_INSTRUCTIONS, probe_rtlsdr)
@@ -221,20 +222,44 @@ def test_source_survives_usb_overflow(overflow_rtlsdr):
     assert Fake.instances, "driver was never opened"
 
 
-def test_overflow_ladder_respects_minimum(overflow_rtlsdr):
-    """If even the minimum read size overflows, keep retrying (never kill a
-    live recording) and warn at a sane rate."""
+def test_overflow_reopens_device_before_retrying(overflow_rtlsdr):
+    """An overflow must close and reopen the handle (fresh libusb handle),
+    never keep reading from the overflowed one."""
     import time
-    from core.sources.sdr import MIN_READ_SAMPLES, RtlSdrSource
+    from core.sources.sdr import RtlSdrSource
+
+    module, Fake = overflow_rtlsdr
+    source = RtlSdrSource(center_freq_hz=145_780_000.0, chunk_samples=12_000)
+    chunks = []
+    source.start(chunks.append)
+    deadline = time.time() + 10.0
+    while len(chunks) < 4 and time.time() < deadline:
+        time.sleep(0.05)
+    source.stop()
+    assert len(chunks) >= 4
+    # the overflowing handle was closed and a new one opened
+    assert len(Fake.instances) >= 2, "device was not reopened"
+    assert all(inst.closed for inst in Fake.instances[:-1])
+
+
+def test_overflow_recovery_is_bounded(overflow_rtlsdr):
+    """A permanently overflowing device fails with guidance instead of
+    looping or crashing."""
+    import time
+    from core.sources.sdr import MAX_OVERFLOW_RECOVERIES, RtlSdrSource
+    from core.sources.base import SourceError
 
     module, Fake = overflow_rtlsdr
     Fake.max_read = 0  # every read overflows
     source = RtlSdrSource(center_freq_hz=145_780_000.0, chunk_samples=12_000)
     source.start(lambda c: None)
-    time.sleep(1.0)
-    assert source.running, "source must not die on a persistent overflow"
-    source.stop()
-    assert Fake.instances[0].closed
+    deadline = time.time() + 30.0
+    while time.time() < deadline and source.running:
+        time.sleep(0.05)
+    with pytest.raises(SourceError) as info:
+        source.stop()
+    assert "USB bandwidth" in str(info.value)
+    assert len(Fake.instances) <= MAX_OVERFLOW_RECOVERIES + 1
 
 
 def test_short_reads_are_reassembled(overflow_rtlsdr):
@@ -267,18 +292,19 @@ def test_short_reads_are_reassembled(overflow_rtlsdr):
 
 def test_read_size_ladder_shrinks_then_stabilizes(overflow_rtlsdr):
     """The ladder halves on overflow and then stops shrinking once reads
-    succeed."""
+    succeed; each retry goes to a freshly opened handle."""
     import time
     from core.sources.sdr import RtlSdrSource
 
     module, Fake = overflow_rtlsdr
     source = RtlSdrSource(center_freq_hz=145_780_000.0, chunk_samples=12_000)
     sizes = []
-    real_read = Fake.read_samples
 
     def recording_read(self, n):
         sizes.append(n)
-        return real_read(self, n)
+        if n > type(self).max_read:
+            raise module.LibUSBError(f"<LIBUSB_ERROR_OVERFLOW (-8)> {n}")
+        return np.arange(n, dtype=np.float64).astype(np.complex64)
 
     Fake.read_samples = recording_read
     chunks = []
