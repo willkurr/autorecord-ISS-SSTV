@@ -204,6 +204,11 @@ class PassPipeline(QObject):
         s = self.settings
         if not source.is_iq:
             return None
+        # Use the rate the device really delivers: the chain's decimation
+        # ratio stays an integer and the audio rate lands on the nearest
+        # multiple of 48 kHz; chunk timestamps are in real-rate seconds.
+        fs_iq = float(getattr(source, "actual_fs", source.fs))
+        ratio = max(1, int(round(fs_iq / 48_000.0)))
         doppler = DopplerModel(self.tracker, s.nominal_freq_hz,
                                enabled=s.doppler_correction)
         if isinstance(source, SimulatorSource):
@@ -215,6 +220,8 @@ class PassPipeline(QObject):
             segment = doppler.segment
         self._doppler_model = doppler
         return ReceiveChain(
+            fs_iq=fs_iq,
+            fs_audio=fs_iq / ratio,
             tuning_offset_hz=s.tuning_offset_hz,
             fine_offset_hz=s.fine_offset_hz,
             deemphasis=s.deemphasis,
@@ -250,15 +257,20 @@ class PassPipeline(QObject):
             freq_hz=s.nominal_freq_hz, fs=48_000.0, meta=meta)
 
         self._chain = self._build_chain(self._source)
-        self._engine = SSTVEngine(48_000.0, on_event=self._on_sstv_event)
+        # everything downstream consumes the chain's audio rate (48 kHz for
+        # a 240 kS/s dongle; the nearest 48 kHz multiple otherwise)
+        audio_fs = self._chain.fs_audio if self._chain is not None else 48_000.0
+        self._engine = SSTVEngine(audio_fs, on_event=self._on_sstv_event)
         if s.monitor_audio:
-            self._monitor = AudioMonitor(48_000.0)
+            self._monitor = AudioMonitor(audio_fs)
+        self._recorder.fs = audio_fs
 
         self._recorder.start()
         self.running = True
         self._source.on_end = lambda: self.sourceDone.emit()
         self._source.start(self._sink)
-        log.info("Pipeline started (source=%s)", s.source_type)
+        log.info("Pipeline started (source=%s, audio=%.0f Hz)",
+                 s.source_type, audio_fs)
 
     def stop(self) -> Dict[str, Any]:
         if not self.running:

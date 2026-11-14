@@ -84,9 +84,12 @@ class Source(ABC):
                     except Exception:  # noqa: BLE001
                         log.exception("source end callback failed")
 
-    @abstractmethod
     def _loop(self, sink: Callable[[Chunk], None]) -> None:
-        ...
+        """Producer loop; subclasses override (called from the source
+        thread by :meth:`_run`).  Sources with their own threading (e.g.
+        the RTL-SDR reader/consumer split) may use a different structure
+        entirely and drive ``sink`` themselves."""
+        raise NotImplementedError
 
     def _cleanup(self) -> None:
         pass

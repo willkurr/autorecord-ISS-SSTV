@@ -8,6 +8,8 @@ lazily, so the rest of the application works without any SDR attached.
 from __future__ import annotations
 
 import logging
+import queue
+import threading
 import time
 from typing import Callable, Optional, Tuple
 
@@ -118,6 +120,15 @@ class RtlSdrSource(TimedSource):
         self.gain = gain
         self.device_index = device_index
         self._sdr = None
+        self.actual_fs: float = float(fs)
+        self._requested_fs = float(fs)
+        # reader thread -> bounded queue -> consumer thread: the reader
+        # must never be blocked by DSP work, or the dongle's FIFO
+        # overflows and samples are dropped
+        self._queue: "queue.Queue[np.ndarray]" = queue.Queue(maxsize=64)
+        self._consumer_thread = None
+        self._sink_cb: Optional[Callable[[Chunk], None]] = None
+        self.dropped_samples = 0
 
     # ------------------------------------------------------------------
     def _open(self):
@@ -141,7 +152,27 @@ class RtlSdrSource(TimedSource):
         # fatal.  PPM correction and gain are optional on some
         # drivers/firmware (e.g. several librtlsdr builds reject ppm = 0),
         # so those failures only degrade gracefully with a warning.
-        self._set_required(sdr, "sample_rate", self.fs)
+        self._set_required(sdr, "sample_rate", self._requested_fs)
+        # The rate the hardware actually locked onto can differ from the one
+        # requested (e.g. 226 kS/s on some dongles/ports).  Decoding every
+        # downstream stage assumes the requested rate, so a mismatch sounds
+        # like crackling/pitch-shifted audio and destroys SSTV timing.
+        actual = None
+        try:
+            actual = float(sdr.sample_rate)
+        except Exception:  # noqa: BLE001
+            pass
+        if actual is not None and abs(actual - self._requested_fs) > 1.0:
+            self.actual_fs = actual
+            self.fs = actual  # timestamps and chunk metadata follow reality
+            correction = abs(actual - self._requested_fs) / self._requested_fs
+            if correction > 0.02:
+                log.warning(
+                    "RTL-SDR running at %.0f Hz instead of the requested "
+                    "%.0f Hz (%.1f%% off). Audio will be pitch-shifted and "
+                    "SSTV sync may fail; the DSP chain now compensates for "
+                    "the real rate.", actual, self._requested_fs,
+                    correction * 100.0)
         self._set_required(sdr, "center_freq", self.center_freq_hz)
         if self.ppm != 0:
             self._set_optional(sdr, "freq_correction", self.ppm, "PPM correction")
@@ -173,25 +204,34 @@ class RtlSdrSource(TimedSource):
                         "suffer - use the Fine offset setting to compensate.",
                         label, value, exc)
 
+    def chunk_fs(self) -> float:
+        """Sample rate the stream is actually produced at.
+
+        Hardware may not honour the requested rate exactly; the raw chunk
+        timestamps and any downstream rate maths must use what the device
+        really delivers.
+        """
+        return float(getattr(self, "actual_fs", self.fs))
+
     # ------------------------------------------------------------------
-    def _loop(self, sink: Callable[[Chunk], None]) -> None:
+    def _reader_loop(self) -> None:
+        """Dedicated USB drain thread.
+
+        This loop must do *nothing* but read and enqueue: the dongle
+        streams continuously into a FIFO only ~15 ms deep, so any pause
+        longer than that (e.g. running the DSP chain inline) silently
+        drops samples - the cause of crackling audio, glitchy recordings
+        and broken SSTV sync.  Keeping this loop tight keeps the FIFO
+        drained.
+        """
         self._open()
         assert self._sdr is not None
-        # macOS's libusb reports LIBUSB_ERROR_OVERFLOW for large
-        # synchronous reads even though the same size works on
-        # Windows/Linux.  Shrink the USB read size until reads succeed;
-        # full pipeline chunks are still emitted regardless of the
-        # underlying read granularity.
-        #
-        # Important: an overflow leaves the device's internal buffer in
-        # an inconsistent state, and continuing on the same handle can
-        # crash libusb natively (segfault on macOS).  So an overflow
-        # triggers a full close/reopen at the smaller read size, and a
-        # bounded number of reopen attempts avoids an endless
-        # close-open-crash cycle if the hardware is genuinely wedged.
+        # Some platforms (macOS, and Linux with certain controllers) fail
+        # synchronous reads of ~24 KB with LIBUSB_ERROR_OVERFLOW.  Shrink
+        # the USB read size until reads succeed; an overflow also poisons
+        # the handle, so each one triggers a close/reopen before the next
+        # read (continuing on an overflowed handle can crash natively).
         read_size = self.chunk_samples
-        buffer = np.zeros(self.chunk_samples * 4, dtype=np.complex64)
-        filled = 0
         overflows = 0
         while not self._stop_evt.is_set():
             try:
@@ -224,10 +264,36 @@ class RtlSdrSource(TimedSource):
                         f"{reopen_exc}") from reopen_exc
                 continue
             if samples is None or len(samples) == 0:
-                time.sleep(0.01)
                 continue
-            samples = np.asarray(samples, dtype=np.complex64).ravel()
-            # make room, then append (amortised buffer growth)
+            overflows = 0
+            self._enqueue(np.asarray(samples, dtype=np.complex64).ravel())
+
+    def _enqueue(self, samples: np.ndarray) -> None:
+        """Queue raw samples for the consumer; drop oldest if it overflows."""
+        if self._queue.full():
+            try:
+                dropped = self._queue.get_nowait()
+                self.dropped_samples += len(dropped)
+                log.warning("RTL-SDR receiver queue overflow: dropped "
+                            "%d samples (the computer cannot keep up with "
+                            "the DSP chain)", len(dropped))
+            except queue.Empty:
+                pass
+        try:
+            self._queue.put_nowait(samples)
+        except queue.Full:
+            self.dropped_samples += len(samples)
+
+    def _consume_loop(self) -> None:
+        """Assemble queued raw reads into full pipeline chunks and hand
+        them to the sink."""
+        buffer = np.zeros(self.chunk_samples * 4, dtype=np.complex64)
+        filled = 0
+        while not self._stop_evt.is_set() or not self._queue.empty():
+            try:
+                samples = self._queue.get(timeout=0.25)
+            except queue.Empty:
+                continue
             if filled + samples.size > buffer.size:
                 grown = np.empty(max(buffer.size,
                                      (filled + samples.size) * 2),
@@ -238,14 +304,71 @@ class RtlSdrSource(TimedSource):
             filled += samples.size
             while filled >= self.chunk_samples:
                 t = self._stamp()
-                sink(Chunk(data=buffer[:self.chunk_samples].copy(), t=t,
-                           is_iq=True, fs=self.fs))
-                remaining = filled - self.chunk_samples
-                buffer[:remaining] = buffer[self.chunk_samples:filled]
-                filled = remaining
-            # several successful reads in a row: the smaller size is
-            # working; allow a future overflow a couple of fresh halvings
-            overflows = 0
+                sink_chunk = Chunk(data=buffer[:self.chunk_samples].copy(),
+                                   t=t, is_iq=True, fs=self.actual_fs)
+                buffer[:filled - self.chunk_samples] = \
+                    buffer[self.chunk_samples:filled]
+                filled -= self.chunk_samples
+                try:
+                    self._sink_cb(sink_chunk)
+                except Exception:  # noqa: BLE001
+                    log.exception("sink failed")
+
+    # ------------------------------------------------------------------
+    def start(self, sink: Callable[[Chunk], None]) -> None:
+        if self._thread is not None or self._consumer_thread is not None:
+            raise SourceError("source already running")
+        self._sink_cb = sink
+        self._stop_evt.clear()
+        self._error = None
+        self._consumer_thread = threading.Thread(
+            target=self._consume_loop, name=f"cons-{self.label}", daemon=True)
+        self._consumer_thread.start()
+        self._thread = threading.Thread(
+            target=self._reader_run, name=f"src-{self.label}", daemon=True)
+        self._thread.start()
+
+    def _reader_run(self) -> None:
+        try:
+            self._reader_loop()
+        except Exception as exc:  # noqa: BLE001 - surface to stop()
+            self._error = exc
+            log.exception("Source %s failed", self.label)
+        finally:
+            self._stop_evt.set()  # unblock (and end) the consumer
+            try:
+                self._cleanup()
+            finally:
+                if self.on_end is not None:
+                    try:
+                        self.on_end()
+                    except Exception:  # noqa: BLE001
+                        log.exception("source end callback failed")
+
+    def _stamp(self) -> float:
+        """Timestamps follow the rate the hardware actually delivers."""
+        if self._t0 is None:
+            self._t0 = time.time()
+        t = self._t0 + self._samples / self.actual_fs
+        self._samples += self.chunk_samples
+        return t
+
+    def stop(self, timeout: float = 10.0) -> None:
+        self._stop_evt.set()
+        if self._consumer_thread is not None:
+            self._consumer_thread.join(timeout=timeout)
+            self._consumer_thread = None
+        if self._thread is not None:
+            self._thread.join(timeout=timeout)
+            self._thread = None
+        if self._error is not None:
+            raise self._error
+
+    @property
+    def running(self) -> bool:
+        return ((self._thread is not None and self._thread.is_alive())
+                or (self._consumer_thread is not None
+                    and self._consumer_thread.is_alive()))
 
     @staticmethod
     def _is_overflow(exc: Exception) -> bool:

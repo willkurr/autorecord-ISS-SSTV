@@ -290,10 +290,48 @@ def test_short_reads_are_reassembled(overflow_rtlsdr):
     assert np.allclose(joined, np.arange(joined.size), atol=1e-6)
 
 
+def test_reader_is_decoupled_from_slow_sink(overflow_rtlsdr):
+    """THE architecture regression: a slow DSP consumer must never stall
+    the USB reader.  If reading pauses while the sink works, the dongle's
+    FIFO overflows and samples are dropped (crackles, glitchy recordings).
+    """
+    import time
+    import numpy as np
+    from core.sources.sdr import RtlSdrSource
+
+    module, Fake = overflow_rtlsdr
+    read_times = []
+    real_read = Fake.read_samples
+
+    def timed_read(self, n):
+        read_times.append(time.time())
+        return real_read(self, n)
+
+    Fake.read_samples = timed_read
+
+    source = RtlSdrSource(center_freq_hz=145_780_000.0, chunk_samples=12_000)
+
+    def slow_sink(chunk):
+        time.sleep(0.2)  # the DSP chain being far slower than real time
+
+    source.start(slow_sink)
+    deadline = time.time() + 8.0
+    while len(read_times) < 12 and time.time() < deadline:
+        time.sleep(0.05)
+    source.stop()
+
+    assert len(read_times) >= 12, "reader stalled behind the slow sink"
+    # reads keep arriving at ~50 ms cadence even though the sink blocks
+    # for 200 ms per chunk; allow generous jitter but not 200 ms stalls
+    gaps = [b - a for a, b in zip(read_times[8:], read_times[9:])]
+    assert max(gaps) < 0.15, f"reader stalled: max gap {max(gaps)*1000:.0f} ms"
+
+
 def test_read_size_ladder_shrinks_then_stabilizes(overflow_rtlsdr):
     """The ladder halves on overflow and then stops shrinking once reads
     succeed; each retry goes to a freshly opened handle."""
     import time
+    import numpy as np
     from core.sources.sdr import RtlSdrSource
 
     module, Fake = overflow_rtlsdr
