@@ -84,3 +84,64 @@ def test_probe_success(fake_rtlsdr):
     assert ok is True
     assert "Generic RTL2832U OEM" in message
     assert Fake.instances[0].closed  # the probe releases the device
+
+
+# ---------------------------------------------------------------------------
+# RtlSdrSource configuration robustness
+
+def _make_source(ppm=0, gain="auto", device_index=None):
+    from core.sources.sdr import RtlSdrSource
+    return RtlSdrSource(center_freq_hz=145_800_000.0 - 20_000.0, ppm=ppm,
+                        gain=gain, device_index=device_index)
+
+
+def test_source_skips_zero_ppm(fake_rtlsdr):
+    """ppm = 0 must not be sent to the driver (some builds reject it)."""
+    module, Fake = fake_rtlsdr
+    calls = []
+
+    def make_setter():
+        prop = property(lambda self: 0,
+                        lambda self, v: calls.append(v))
+        return prop
+
+    Fake.freq_correction = make_setter()
+    source = _make_source(ppm=0)
+    source._open()
+    try:
+        assert calls == []          # never set
+        assert source._sdr is not None
+    finally:
+        source._cleanup()
+
+
+def test_source_ppm_failure_is_non_fatal(fake_rtlsdr):
+    """A rejecting ppm setter only warns; the source still opens."""
+    module, Fake = fake_rtlsdr
+
+    def raise_setter(self, v):
+        raise OSError("LIBUSB_ERROR_INVALID_PARAM")
+
+    Fake.freq_correction = property(lambda self: 0, raise_setter)
+    source = _make_source(ppm=30)
+    source._open()
+    try:
+        assert source._sdr is not None
+    finally:
+        source._cleanup()
+
+
+def test_source_required_setting_failure_is_fatal(fake_rtlsdr):
+    """A failing sample-rate setter aborts the source with SourceError."""
+    module, Fake = fake_rtlsdr
+
+    def raise_setter(self, v):
+        raise OSError("cannot set rate")
+
+    Fake.sample_rate = property(lambda self: 0, raise_setter)
+    from core.sources.base import SourceError
+    source = _make_source()
+    with pytest.raises(SourceError):
+        source._open()
+    # the device was released
+    assert Fake.instances[0].closed

@@ -132,21 +132,41 @@ class RtlSdrSource(TimedSource):
                 + _NO_DEVICE_INSTRUCTIONS
                 + f"\n(open error: {exc})"
             ) from exc
+        # Sample rate and center frequency are essential: failure here is
+        # fatal.  PPM correction and gain are optional on some
+        # drivers/firmware (e.g. several librtlsdr builds reject ppm = 0),
+        # so those failures only degrade gracefully with a warning.
+        self._set_required(sdr, "sample_rate", self.fs)
+        self._set_required(sdr, "center_freq", self.center_freq_hz)
+        if self.ppm != 0:
+            self._set_optional(sdr, "freq_correction", self.ppm, "PPM correction")
+        if isinstance(self.gain, str):
+            self._set_optional(sdr, "gain", self.gain, "gain")
+        else:
+            self._set_optional(sdr, "gain", float(self.gain), "gain")
+        log.info("RTL-SDR opened: center=%.6f MHz, fs=%.0f Hz, ppm=%d, gain=%s",
+                 self.center_freq_hz / 1e6, self.fs, self.ppm,
+                 sdr.gain if not isinstance(self.gain, str) else "auto")
+        self._sdr = sdr
+
+    @staticmethod
+    def _set_required(sdr, attr: str, value) -> None:
         try:
-            sdr.sample_rate = self.fs
-            sdr.center_freq = self.center_freq_hz
-            sdr.freq_correction = self.ppm
-            if isinstance(self.gain, str):
-                sdr.gain = self.gain  # 'auto'
-            else:
-                sdr.gain = float(self.gain)
-            log.info("RTL-SDR opened: center=%.6f MHz, fs=%.0f Hz, ppm=%d, gain=%s",
-                     self.center_freq_hz / 1e6, self.fs, self.ppm,
-                     sdr.gain if not isinstance(self.gain, str) else "auto")
+            setattr(sdr, attr, value)
         except Exception as exc:  # noqa: BLE001
             sdr.close()
-            raise SourceError(f"Failed to configure RTL-SDR: {exc}") from exc
-        self._sdr = sdr
+            raise SourceError(
+                f"Failed to set RTL-SDR {attr} to {value}: {exc}") from exc
+
+    @staticmethod
+    def _set_optional(sdr, attr: str, value, label: str) -> None:
+        try:
+            setattr(sdr, attr, value)
+        except Exception as exc:  # noqa: BLE001 - non-fatal
+            log.warning("Could not set RTL-SDR %s to %s (%s); continuing. "
+                        "Reception still works, but frequency accuracy may "
+                        "suffer - use the Fine offset setting to compensate.",
+                        label, value, exc)
 
     # ------------------------------------------------------------------
     def _loop(self, sink: Callable[[Chunk], None]) -> None:
