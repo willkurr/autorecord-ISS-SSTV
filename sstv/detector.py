@@ -73,15 +73,22 @@ class VISDetector:
         self._t_bit = None
 
     def _gate_frame(self, frame: ToneFrame) -> np.ndarray:
+        """Signal-present mask: rejects dead air, not quiet signals.
+
+        The reference tracks the *current* level within a couple of frames
+        (a slow-decaying reference kept the gate closed for many seconds
+        after any loud transmission - e.g. a voice callsign - and silenced
+        a following SSTV image that was transmitted tens of dB quieter).
+        The VIS validation chain is what rejects noise; this mask only
+        needs to kill digital silence.
+        """
         env = frame.env
         if env.size == 0:
             return env.astype(bool)
-        ref = float(np.percentile(env, 95)) if env.size > 16 else float(np.max(env))
-        if ref > self._env_ref:
-            self._env_ref = ref
-        else:
-            self._env_ref = 0.995 * self._env_ref + 0.005 * ref
-        return env > (0.20 * max(self._env_ref, 1e-9))
+        local = (float(np.percentile(env, 95)) if env.size > 16
+                 else float(np.max(env)))
+        self._env_ref = 0.3 * self._env_ref + 0.7 * local
+        return env > max(0.05 * self._env_ref, 1e-5)
 
     def _append(self, frame: ToneFrame) -> None:
         if len(self._buf) == 0:

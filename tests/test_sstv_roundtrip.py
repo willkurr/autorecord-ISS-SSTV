@@ -110,6 +110,29 @@ def test_roundtrip_noisy_signal(rng):
     assert np.corrcoef(y_orig, y_dec)[0, 1] > 0.85
 
 
+def test_quiet_signal_after_loud_voice(rng):
+    """A quiet SSTV image right after loud voice must still be detected.
+
+    Regression: the detector's envelope gate used a slow-decaying
+    reference, so a transmission tens of dB quieter than a preceding
+    voice ID stayed gated out for its whole duration (a real recorded
+    case).  The gate now tracks the current level within ~200 ms.
+    """
+    img = test_image()
+    audio = encode_robot36(img, FS, amplitude=0.032)  # ~25 dB below voice
+    voice = rng.normal(0, 0.25, int(6.0 * FS)).astype(np.float32)  # "callsign"
+    gap = np.zeros(int(2.0 * FS), np.float32)
+    stream = np.concatenate([voice, gap, audio,
+                             np.zeros(int(1.0 * FS), np.float32)])
+    events = collect_events(None, stream, rng)
+    comps = [e for e in events if e.type == EventType.IMAGE_COMPLETE]
+    assert len(comps) == 1, "quiet image after loud voice was not detected"
+    assert not comps[0].truncated
+    y_orig = img.mean(axis=2).ravel()
+    y_dec = comps[0].image.mean(axis=2).ravel()
+    assert np.corrcoef(y_orig, y_dec)[0, 1] > 0.9
+
+
 def test_two_images_back_to_back(rng):
     img = test_image()
     audio = np.concatenate([
