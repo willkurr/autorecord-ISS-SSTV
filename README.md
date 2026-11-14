@@ -75,6 +75,14 @@ Then `pip install pyrtlsdr`.  Blacklist the DVB-TV drivers on Linux
 echo "blacklist dvb_usb_rtl28xxu" | sudo tee /etc/modprobe.d/blacklist-rtl.conf
 ```
 
+**macOS:** libusb on macOS raises `LIBUSB_ERROR_OVERFLOW` for large
+synchronous USB reads, which can break streaming even though the dongle
+opens fine.  The application detects this automatically and steps the USB
+read size down until reads succeed, so no action is normally needed.  If
+overflows persist even at small read sizes, try another USB port (avoid
+hubs and USB-C adapters), a shorter cable, or check Activity Monitor for
+CPU contention.
+
 ## Usage
 
 ```bash

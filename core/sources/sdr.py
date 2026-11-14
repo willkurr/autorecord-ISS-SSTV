@@ -181,28 +181,49 @@ class RtlSdrSource(TimedSource):
         # read size until it succeeds; full pipeline chunks are still
         # emitted regardless of the underlying read granularity.
         read_size = self.chunk_samples
-        pending = np.zeros(0, dtype=np.complex64)
+        buffer = np.zeros(self.chunk_samples * 4, dtype=np.complex64)
+        filled = 0
+        overflow_retries = 0
         while not self._stop_evt.is_set():
             try:
                 samples = self._sdr.read_samples(read_size)
             except Exception as exc:  # noqa: BLE001
-                if self._is_overflow(exc) and read_size > MIN_READ_SAMPLES:
-                    read_size = max(MIN_READ_SAMPLES, read_size // 2)
-                    log.warning("RTL-SDR USB overflow; retrying with "
-                                "%d-sample reads", read_size)
-                    time.sleep(0.02)  # let the device buffers drain
-                    continue
+                if self._is_overflow(exc):
+                    overflow_retries += 1
+                    if read_size > MIN_READ_SAMPLES:
+                        read_size = max(MIN_READ_SAMPLES, read_size // 2)
+                        log.warning("RTL-SDR USB overflow; retrying with "
+                                    "%d-sample reads", read_size)
+                        time.sleep(0.02)  # let the device buffers drain
+                        continue
+                    if overflow_retries % 50 == 1:
+                        log.warning(
+                            "RTL-SDR still overflowing at %d-sample reads; "
+                            "check USB 2.0 port / cable / hub", read_size)
+                    time.sleep(0.02)
+                    continue  # keep retrying; do not kill the recording
                 raise SourceError(f"RTL-SDR read failed: {exc}") from exc
             if samples is None or len(samples) == 0:
                 time.sleep(0.01)
                 continue
-            pending = np.concatenate(
-                [pending, np.asarray(samples, dtype=np.complex64).ravel()])
-            while len(pending) >= self.chunk_samples:
+            overflow_retries = 0
+            samples = np.asarray(samples, dtype=np.complex64).ravel()
+            # make room, then append (amortised buffer growth)
+            if filled + samples.size > buffer.size:
+                grown = np.empty(max(buffer.size,
+                                     (filled + samples.size) * 2),
+                                 dtype=np.complex64)
+                grown[:filled] = buffer[:filled]
+                buffer = grown
+            buffer[filled:filled + samples.size] = samples
+            filled += samples.size
+            while filled >= self.chunk_samples:
                 t = self._stamp()
-                chunk = pending[:self.chunk_samples]
-                pending = pending[self.chunk_samples:]
-                sink(Chunk(data=chunk, t=t, is_iq=True, fs=self.fs))
+                sink(Chunk(data=buffer[:self.chunk_samples].copy(), t=t,
+                           is_iq=True, fs=self.fs))
+                remaining = filled - self.chunk_samples
+                buffer[:remaining] = buffer[self.chunk_samples:filled]
+                filled = remaining
 
     @staticmethod
     def _is_overflow(exc: Exception) -> bool:

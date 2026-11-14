@@ -222,22 +222,70 @@ def test_source_survives_usb_overflow(overflow_rtlsdr):
 
 
 def test_overflow_ladder_respects_minimum(overflow_rtlsdr):
-    """If even the minimum read size overflows, the source fails cleanly."""
+    """If even the minimum read size overflows, keep retrying (never kill a
+    live recording) and warn at a sane rate."""
     import time
-    from core.sources.sdr import RtlSdrSource
-    from core.sources.base import SourceError
+    from core.sources.sdr import MIN_READ_SAMPLES, RtlSdrSource
 
     module, Fake = overflow_rtlsdr
     Fake.max_read = 0  # every read overflows
     source = RtlSdrSource(center_freq_hz=145_780_000.0, chunk_samples=12_000)
-    errors = []
-    original = source._error if hasattr(source, "_error") else None
     source.start(lambda c: None)
+    time.sleep(1.0)
+    assert source.running, "source must not die on a persistent overflow"
+    source.stop()
+    assert Fake.instances[0].closed
+
+
+def test_short_reads_are_reassembled(overflow_rtlsdr):
+    """Drivers that return fewer samples than requested must still yield
+    full, gap-free pipeline chunks."""
+    import time
+    import numpy as np
+    from core.sources.sdr import RtlSdrSource
+
+    module, Fake = overflow_rtlsdr
+
+    original = Fake.read_samples
+
+    def short_read(self, n):
+        return original(self, min(n, 700))  # always short of the request
+
+    Fake.read_samples = short_read
+    source = RtlSdrSource(center_freq_hz=145_780_000.0, chunk_samples=12_000)
+    chunks = []
+    source.start(chunks.append)
     deadline = time.time() + 10.0
-    while time.time() < deadline:
+    while len(chunks) < 8 and time.time() < deadline:
         time.sleep(0.05)
-        if not source.running:
-            break
-    with pytest.raises(SourceError):
-        source.stop()  # surfaces the thread's error
-    Fake.instances[0].closed = True  # cleanup already ran
+    source.stop()
+    assert len(chunks) >= 8
+    assert all(len(c.data) == 12_000 for c in chunks)
+    joined = np.concatenate([c.data.real for c in chunks[:8]])
+    assert np.allclose(joined, np.arange(joined.size), atol=1e-6)
+
+
+def test_read_size_ladder_shrinks_then_stabilizes(overflow_rtlsdr):
+    """The ladder halves on overflow and then stops shrinking once reads
+    succeed."""
+    import time
+    from core.sources.sdr import RtlSdrSource
+
+    module, Fake = overflow_rtlsdr
+    source = RtlSdrSource(center_freq_hz=145_780_000.0, chunk_samples=12_000)
+    sizes = []
+    real_read = Fake.read_samples
+
+    def recording_read(self, n):
+        sizes.append(n)
+        return real_read(self, n)
+
+    Fake.read_samples = recording_read
+    chunks = []
+    source.start(chunks.append)
+    deadline = time.time() + 10.0
+    while len(chunks) < 5 and time.time() < deadline:
+        time.sleep(0.05)
+    source.stop()
+    assert sizes[:3] == [12_000, 6_000, 3_000]  # two halvings
+    assert all(s == 3_000 for s in sizes[3:]), sizes

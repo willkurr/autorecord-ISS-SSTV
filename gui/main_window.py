@@ -285,6 +285,15 @@ class MainWindow(QMainWindow):
         self.live_tab.pass_finished()
         self.images_tab.refresh()
         wav = result.get("wav_path")
+        err = result.get("error")
+        if err:
+            self.statusBar().showMessage("Recording stopped: receiver error", 10000)
+            QMessageBox.warning(
+                self, "Recording stopped",
+                "The receiver stopped unexpectedly:\n\n"
+                f"{err}\n\n"
+                "Any audio captured before the failure was saved.")
+            return
         msg = f"Recording saved: {wav.name if wav else 'n/a'} " \
               f"({result.get('images', 0)} image(s))"
         self.statusBar().showMessage(msg, 10000)

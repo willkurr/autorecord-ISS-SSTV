@@ -264,10 +264,12 @@ class PassPipeline(QObject):
         if not self.running:
             return self.result
         self.running = False
+        source_error = None
         try:
             if self._source is not None:
                 self._source.stop()
         except Exception as exc:  # noqa: BLE001
+            source_error = str(exc)
             log.warning("Source stop failed: %s", exc)
         if self._engine is not None:
             try:
@@ -287,6 +289,7 @@ class PassPipeline(QObject):
             "wav_path": wav_path,
             "images": len(self._recorder._images) if self._recorder else 0,
             "pass": self.pass_info,
+            "error": source_error,
         }
         self._source = None
         self._chain = None
