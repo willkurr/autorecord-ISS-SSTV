@@ -8,7 +8,7 @@ via Qt signals (queued connections make cross-thread emission safe).
 from __future__ import annotations
 
 import logging
-import queue
+import threading
 import time
 from typing import Any, Dict, Optional
 
@@ -32,36 +32,93 @@ log = logging.getLogger(__name__)
 SPECTRUM_BINS = 512
 
 
+class AudioReservoir:
+    """Jitter-absorbing sample buffer between the DSP thread and the
+    sound-card callback.
+
+    The DSP produces audio in bursts (one ~100 ms chunk at a time) while
+    the callback consumes a fixed small block at exact intervals.  Feeding
+    the callback straight from a chunk queue causes stutter on every
+    scheduling hiccup (and, worse, can replay chunk remainders out of
+    order).  The reservoir decouples the two: writers append; the callback
+    pulls exactly what it needs.  Playback only starts once the reservoir
+    holds a small prebuffer, and an underrun re-primes it so a hiccup
+    costs one dropout instead of a sustained choppy cycle.
+    """
+
+    PREBUFFER_S = 0.15   # playback starts at this fill level
+    MAX_BUFFER_S = 1.0   # bound latency; older audio is dropped beyond this
+
+    def __init__(self, fs: float,
+                 prebuffer_s: float = PREBUFFER_S,
+                 max_buffer_s: float = MAX_BUFFER_S):
+        self.fs = float(fs)
+        self._prebuffer = max(1, int(prebuffer_s * fs))
+        self._maxlen = max(self._prebuffer, int(max_buffer_s * fs))
+        self._buf = np.zeros(0, dtype=np.float32)
+        self._primed = False
+        self._lock = threading.Lock()
+        self.underruns = 0
+
+    def write(self, audio: np.ndarray) -> None:
+        """Append samples (called from the DSP thread)."""
+        audio = np.asarray(audio, dtype=np.float32).ravel()
+        if audio.size == 0:
+            return
+        with self._lock:
+            self._buf = np.concatenate([self._buf, audio])
+            if len(self._buf) > self._maxlen:
+                self._buf = self._buf[-self._maxlen:]
+
+    def pull(self, frames: int) -> np.ndarray:
+        """Take exactly ``frames`` samples (called from the audio thread).
+
+        Returns zeros while the prebuffer is filling and for whatever the
+        reservoir cannot supply during an underrun.
+        """
+        out = np.zeros(frames, dtype=np.float32)
+        with self._lock:
+            if not self._primed:
+                if len(self._buf) < self._prebuffer:
+                    return out
+                self._primed = True
+            n = min(frames, len(self._buf))
+            if n == 0:
+                # underrun: wait for a fresh prebuffer before resuming
+                self._primed = False
+                self.underruns += 1
+                return out
+            out[:n] = self._buf[:n]
+            self._buf = self._buf[n:]
+            if n < frames:
+                # partial frame: drop out and re-prime (audio has a gap)
+                self._primed = False
+                self.underruns += 1
+        return out
+
+    def reset(self) -> None:
+        with self._lock:
+            self._buf = np.zeros(0, dtype=np.float32)
+            self._primed = False
+
+
 class AudioMonitor:
     """Plays the demodulated audio to the default output (best effort)."""
 
     def __init__(self, fs: float = 48_000.0):
         self.fs = float(fs)
         self._stream = None
-        self._queue: "queue.Queue[np.ndarray]" = queue.Queue(maxsize=32)
+        self.reservoir = AudioReservoir(fs)
         try:
             import sounddevice
 
             def callback(outdata, frames, time_info, status):
-                try:
-                    block = self._queue.get_nowait()
-                except queue.Empty:
-                    outdata.fill(0)
-                    return
-                if len(block) < frames:
-                    outdata[:len(block), 0] = block
-                    outdata[len(block):] = 0
-                else:
-                    outdata[:, 0] = block[:frames]
-                    if len(block) > frames:
-                        try:
-                            self._queue.put_nowait(block[frames:])
-                        except queue.Full:
-                            pass
+                outdata[:, 0] = self.reservoir.pull(frames)
 
             self._stream = sounddevice.OutputStream(
                 samplerate=int(self.fs), channels=1, dtype="float32",
-                blocksize=1024, callback=callback)
+                blocksize=0,  # let PortAudio pick its native block size
+                callback=callback)
             self._stream.start()
             log.info("Audio monitoring enabled")
         except Exception as exc:  # noqa: BLE001 - monitoring is optional
@@ -69,12 +126,9 @@ class AudioMonitor:
             self._stream = None
 
     def write(self, audio: np.ndarray) -> None:
-        if self._stream is None:
-            return
-        try:
-            self._queue.put_nowait(np.asarray(audio, dtype=np.float32))
-        except queue.Full:
-            pass  # drop rather than stall the DSP thread
+        # buffer even without a stream: if the device appears later the
+        # audio continues seamlessly; the reservoir bounds its own latency
+        self.reservoir.write(audio)
 
     def close(self) -> None:
         if self._stream is not None:
