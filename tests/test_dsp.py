@@ -5,10 +5,13 @@ import numpy as np
 import pytest
 
 from core.dsp import FMModulator, Preemphasis, ReceiveChain
+from core.doppler import DopplerModel
+from core.tracker import Tracker
 from sstv.encoder import encode_robot36, test_image
 from sstv.engine import SSTVEngine
 from sstv.events import EventType
 from sstv.freq import StreamingAnalytic
+from tests.conftest import ISS_TLE
 
 FS_IQ = 240_000
 FS_AUDIO = 48_000
@@ -59,6 +62,39 @@ def test_tone_survives_doppler():
     mid = frame.freq[int(0.2 * FS_AUDIO):int(1.8 * FS_AUDIO)]
     assert abs(np.median(mid) - 1900.0) < 25.0
     assert np.percentile(np.abs(mid - 1900.0), 90) < 80.0
+
+
+def test_dsp_keeps_up_in_real_time():
+    """The full chain+engine must process a 50 ms chunk well under 50 ms.
+
+    Regression guard: the detector once scanned its whole rolling buffer
+    in a Python loop every chunk (~10 ms here, far worse on other
+    machines), starving the live monitor.  Noise input keeps the
+    detector in its seeking state, the expensive path.
+    """
+    import time as _time
+    tracker = Tracker(ISS_TLE)
+    tracker.set_station(40.0, -105.0, 1600.0)
+    dop = DopplerModel(tracker, 145_800_000.0)
+    chain = ReceiveChain(
+        doppler_segment=lambda t0, t1, n: dop.segment(t0, t1, n))
+    engine = SSTVEngine(48_000.0)
+    rng = np.random.default_rng(1)
+    iq = (rng.normal(size=12_000)
+          + 1j * rng.normal(size=12_000)).astype(np.complex64)
+    chain.process(iq, 1_700_000_000.0)   # warm-up (allocations, caches)
+    engine.process(np.zeros(2400, np.float32))
+
+    n = 60
+    t0 = _time.perf_counter()
+    for k in range(n):
+        t = 1_700_000_000.0 + k * 12_000 / 240_000.0
+        engine.process(chain.process(iq, t))
+    per_chunk_ms = (_time.perf_counter() - t0) / n * 1000.0
+    assert per_chunk_ms < 25.0, (
+        f"DSP takes {per_chunk_ms:.1f} ms per 50 ms chunk - the live "
+        "monitor will starve")
+    assert engine.detector._env_ref >= 0  # seek path was exercised
 
 
 def test_channel_passes_full_carson_bandwidth():

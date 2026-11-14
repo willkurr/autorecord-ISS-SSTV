@@ -54,25 +54,6 @@ class Detection:
     data_start: int  # global sample index where image lines begin
 
 
-def _runs(mask: np.ndarray, base: int) -> List[Tuple[int, int]]:
-    """Closed True-runs of ``mask`` as global (start, end) pairs.
-
-    A run that reaches the end of the array is considered still open and
-    is not returned.
-    """
-    runs: List[Tuple[int, int]] = []
-    if mask.size == 0:
-        return runs
-    m = mask.view(np.int8)
-    d = np.diff(np.concatenate([[0], m, [0]]))
-    rise = np.nonzero(d == 1)[0]
-    fall = np.nonzero(d == -1)[0]
-    for r, f in zip(rise, fall):
-        if f < mask.size:  # exclude a run that hits the buffer end
-            runs.append((base + int(r), base + int(f)))
-    return runs
-
-
 class VISDetector:
     """Streaming VIS header detector with a small rolling history."""
 
@@ -185,45 +166,47 @@ class VISDetector:
         return None
 
     def _leader_regions(self, in_leader: np.ndarray, gap_max: int):
-        """Yield (start, end, in_band_count) for each leader region."""
-        n = len(in_leader)
+        """Yield (start, end, in_band_count) for each leader region.
+
+        Maximal spans of in-band samples tolerating gaps of up to
+        ``gap_max``.  Vectorized via the True-sample indices: this runs
+        on every chunk against the whole rolling buffer, so a Python
+        sample loop here would dominate the CPU budget.
+        """
+        idx = np.nonzero(in_leader)[0]
+        if idx.size == 0:
+            return []
+        # split where the gap between consecutive True samples is too large
+        # (gap = diff - 1 False samples; the old walk broke at gap > gap_max)
+        breaks = np.nonzero(np.diff(idx) > gap_max)[0]
+        starts = np.concatenate([[0], breaks + 1])
+        ends = np.concatenate([breaks + 1, [idx.size]])
         regions = []
-        i = 0
-        while i < n:
-            if in_leader[i]:
-                j = i
-                last_in = i
-                count = 0
-                while j < n:
-                    if in_leader[j]:
-                        last_in = j
-                        count += 1
-                    elif j - last_in > gap_max:
-                        break
-                    j += 1
-                regions.append((i, last_in + 1, count))
-                i = j
-            else:
-                i += 1
+        for s, e in zip(starts, ends):
+            seg = idx[s:e]
+            regions.append((int(seg[0]), int(seg[-1]) + 1, int(seg.size)))
         return regions
 
     def _find_start_drop(self, below: np.ndarray, l_end: int,
                          drop_min: int, n: int) -> Optional[int]:
         """First sustained low run that starts after a leader region."""
-        i = l_end
-        while i < n:
-            if below[i]:
-                j = i
-                while j < n and below[j]:
-                    j += 1
-                if j - i >= drop_min:
-                    if j >= n:
-                        return None  # run may still grow; wait for more data
-                    return i
-                i = j
-            else:
-                i += 1
-        return None
+        idx = np.nonzero(below[l_end:])[0]
+        if idx.size == 0:
+            return None
+        idx = idx + l_end
+        # group consecutive indices into runs
+        breaks = np.nonzero(np.diff(idx) > 1)[0]
+        run_starts = np.concatenate([[idx[0]], idx[breaks + 1]])
+        run_ends = np.concatenate([idx[breaks] + 1, [idx[-1] + 1]])
+        lengths = run_ends - run_starts
+        ok = np.nonzero(lengths >= drop_min)[0]
+        if ok.size == 0:
+            return None
+        r0 = ok[0]
+        start, end = int(run_starts[r0]), int(run_ends[r0])
+        if end >= n:
+            return None  # run may still grow; wait for more data
+        return start
 
     # ------------------------------------------------------------------
     def _vis(self) -> Optional[Detection]:
