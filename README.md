@@ -77,7 +77,7 @@ If using an RTL-SDR to capture satellite passes, the drivers can be installed wi
 | macOS | `brew install librtlsdr` |
 | Windows | Install the [Zadig](https://zadig.akeo.ie/) WinUSB driver for the dongle, then place `rtlsdr.dll` on `PATH` or next to the program |
 
-Then `pip install pyrtlsdr`. On Linux, you will probably need to blacklist the DVB-TV drivers (`dvb_usb_rtl28xxu`) if the dongle is claimed by the kernel:
+On Linux, you will probably need to blacklist the DVB-TV drivers (`dvb_usb_rtl28xxu`) if the dongle is claimed by the kernel:
 
 ```bash
 echo "blacklist dvb_usb_rtl28xxu" | sudo tee /etc/modprobe.d/blacklist-rtl.conf
