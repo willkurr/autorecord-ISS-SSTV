@@ -49,18 +49,27 @@ live as they come down, and files everything away for later review.
   RTL-SDR.  A sound-card input is also available for decoding from any
   receiver.
 
-## Requirements
+## Installation
 
-- Python 3.8+ (3.10+ recommended)
+### Requirements
+
+This project requires Python 3.8+ (3.10+ recommended) and the following pip packages:
+
 - numpy, scipy, skyfield, requests, PySide6
 - For RTL-SDR reception: `pyrtlsdr` and the librtlsdr native library
 - For audio monitoring / sound-card input: `sounddevice` + PortAudio
+
+First, install all the required packages with
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### RTL-SDR driver notes
+(Note that you may want to create a Python virtual environment first with `python -m venv .venv`, then run `.\.venv\Scripts\activate` (Windows) or `source ./.venv/bin/activate` (Mac/Linux) to activate the virtual environment. You now have a clean Python environment where the required packages can be installed with `pip` in the command above.)
+
+### RTL-SDR driver
+
+If using an RTL-SDR to capture satellite passes, the drivers can be installed with the following commands:
 
 | OS | librtlsdr |
 |----|-----------|
@@ -68,22 +77,17 @@ pip install -r requirements.txt
 | macOS | `brew install librtlsdr` |
 | Windows | Install the [Zadig](https://zadig.akeo.ie/) WinUSB driver for the dongle, then place `rtlsdr.dll` on `PATH` or next to the program |
 
-Then `pip install pyrtlsdr`.  Blacklist the DVB-TV drivers on Linux
-(`dvb_usb_rtl28xxu`) if the dongle is claimed by the kernel:
+Then `pip install pyrtlsdr`. On Linux, you will probably need to blacklist the DVB-TV drivers (`dvb_usb_rtl28xxu`) if the dongle is claimed by the kernel:
 
 ```bash
 echo "blacklist dvb_usb_rtl28xxu" | sudo tee /etc/modprobe.d/blacklist-rtl.conf
 ```
 
-**macOS:** libusb on macOS raises `LIBUSB_ERROR_OVERFLOW` for large
-synchronous USB reads, which can break streaming even though the dongle
-opens fine.  The application detects this automatically and steps the USB
-read size down until reads succeed, so no action is normally needed.  If
-overflows persist even at small read sizes, try another USB port (avoid
-hubs and USB-C adapters), a shorter cable, or check Activity Monitor for
-CPU contention.
-
 ## Usage
+
+Once you have the Python environment setup and packages/drivers have been installed, simply run `python main.py`.
+
+Other run options are available:
 
 ```bash
 python main.py                # launch the GUI
