@@ -28,6 +28,7 @@ class Settings:
     gain_auto: bool = True
     manual_gain_db: float = 32.8
     channel_bw_hz: float = 15_000.0
+    fm_deviation_hz: float = 5_000.0
     deemphasis: bool = True
     doppler_correction: bool = True
     monitor_audio: bool = False
@@ -51,6 +52,8 @@ class Settings:
         assert 0.0 <= self.min_el_deg < 90.0, "min elevation out of range"
         assert 1e6 < self.nominal_freq_hz < 30e9, "frequency out of range"
         assert 0.0 <= self.tuning_offset_hz < 100e3, "tuning offset out of range"
+        assert 500.0 <= self.fm_deviation_hz <= 15000.0, \
+            "FM deviation out of range"
         assert self.source_type in ("rtlsdr", "soundcard", "sim")
 
 

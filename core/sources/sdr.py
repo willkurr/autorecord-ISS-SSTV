@@ -61,8 +61,11 @@ MIN_READ_SAMPLES = 1024
 MAX_OVERFLOW_RECOVERIES = 10
 
 
-def probe_rtlsdr() -> Tuple[bool, str]:
+def probe_rtlsdr(test_freq_hz: float = 145_800_000.0) -> Tuple[bool, str]:
     """Check the RTL-SDR software stack and hardware, without blocking.
+
+    ``test_freq_hz`` should be the configured downlink frequency so the
+    test read exercises the same band the station will actually use.
 
     Returns ``(ok, message)``: a human-readable success report, or a
     failure description that includes platform-specific setup
@@ -83,7 +86,7 @@ def probe_rtlsdr() -> Tuple[bool, str]:
     try:
         # exercise the device with a short test read
         sdr.sample_rate = 240_000
-        sdr.center_freq = 145_800_000.0
+        sdr.center_freq = float(test_freq_hz)
         samples = sdr.read_samples(8192)
         name = getattr(sdr, "device_name", "unknown device")
         sdr.close()
@@ -92,7 +95,8 @@ def probe_rtlsdr() -> Tuple[bool, str]:
             return False, ("RTL-SDR opened but returned no samples.\n\n"
                            + _NO_DEVICE_INSTRUCTIONS)
         return True, (f"RTL-SDR is working.\n\nDevice: {name}\n"
-                      f"Test read: {n} samples at 240 kS/s")
+                      f"Test read: {n} samples at 240 kS/s on "
+                      f"{test_freq_hz / 1e6:.3f} MHz")
     except Exception as exc:  # noqa: BLE001
         try:
             sdr.close()

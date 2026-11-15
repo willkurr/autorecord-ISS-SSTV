@@ -85,6 +85,48 @@ def test_full_simulated_pass(tca_pass, tmp_path):
         assert np.abs(comp.image.astype(float) - img.astype(float)).mean() < 25.0
 
 
+def test_full_simulated_pass_70cm(tca_pass):
+    """Same pass at 437.550 MHz with 5 kHz deviation: 3x doppler swing plus
+    the wider FM deviation must decode identically."""
+    tracker, pinfo = tca_pass
+    freq = 437_550_000.0
+    dev = 5000.0
+    sim = SimulatorSource(
+        tracker, pinfo, freq_hz=freq, deviation_hz=dev, images=[test_image()],
+        snr_db=15.0, speed=SPEED, preroll_s=5.0, postroll_s=5.0,
+        first_image_delay_s=20.0)
+    dop_model = DopplerModel(tracker, freq)
+
+    def chain_dop(t0, t1, n):
+        return dop_model.segment(sim.sim_time(t0), sim.sim_time(t1), n)
+
+    chain = ReceiveChain(deviation_hz=dev, doppler_segment=chain_dop)
+    events = []
+    engine = SSTVEngine(48_000.0, on_event=events.append)
+
+    def sink(chunk):
+        audio = chain.process(chunk.data, chunk.t)
+        engine.process(audio)
+
+    sim.start(sink)
+    deadline = time.time() + 240.0
+    while sim.running and time.time() < deadline:
+        time.sleep(0.2)
+    sim.stop()
+    engine.flush()
+
+    comps = [e for e in events if e.type == EventType.IMAGE_COMPLETE]
+    assert len(comps) == 2, f"expected 2 image completions, got {len(comps)}"
+    img = test_image()
+    y_orig = img.mean(axis=2).ravel()
+    for comp in comps:
+        assert not comp.truncated
+        assert comp.sync_quality >= 0.98
+        y_dec = comp.image.mean(axis=2).ravel()
+        assert np.corrcoef(y_orig, y_dec)[0, 1] > 0.9
+        assert np.abs(comp.image.astype(float) - img.astype(float)).mean() < 25.0
+
+
 def test_noise_only_pass_no_false_detection(tca_pass):
     """A carrier-only noisy pass (no images) must not trigger detection."""
     tracker, pinfo = tca_pass

@@ -46,6 +46,12 @@ class SettingsDialog(QDialog):
         self.chan_bw = self._spin(4000.0, 60000.0, 0, s.channel_bw_hz)
         self.chan_bw.setSuffix(" Hz")
         rform.addRow("Channel bandwidth", self.chan_bw)
+        self.deviation = self._spin(500.0, 15000.0, 0, s.fm_deviation_hz)
+        self.deviation.setSuffix(" Hz")
+        self.deviation.setToolTip("Peak FM deviation of the downlink "
+                                  "transmitter; the recovered audio is "
+                                  "normalized to this (ISS SSTV: 5000 Hz)")
+        rform.addRow("FM deviation", self.deviation)
         self.deemph = QCheckBox("Apply 750 us de-emphasis")
         self.deemph.setChecked(s.deemphasis)
         rform.addRow(self.deemph)
@@ -122,7 +128,7 @@ class SettingsDialog(QDialog):
         QApplication.setOverrideCursor(Qt.WaitCursor)
         QApplication.processEvents()
         try:
-            ok, message = probe_rtlsdr()
+            ok, message = probe_rtlsdr(test_freq_hz=self.s.nominal_freq_hz)
         finally:
             QApplication.restoreOverrideCursor()
             self.rtlsdr_check_btn.setEnabled(True)
@@ -168,6 +174,7 @@ class SettingsDialog(QDialog):
         s.gain_auto = self.gain_auto.isChecked()
         s.manual_gain_db = self.gain_db.value()
         s.channel_bw_hz = self.chan_bw.value()
+        s.fm_deviation_hz = self.deviation.value()
         s.deemphasis = self.deemph.isChecked()
         s.doppler_correction = self.doppler.isChecked()
         s.monitor_audio = self.monitor.isChecked()

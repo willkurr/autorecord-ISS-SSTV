@@ -133,6 +133,81 @@ def test_fine_offset_correction():
     assert abs(np.median(mid) - 1500.0) < 25.0
 
 
+def test_full_scale_at_5khz_deviation():
+    """A 5 kHz-deviation signal normalized by its actual deviation reaches
+    full scale without clipping; the legacy fixed 4 kHz scale flat-tops it.
+
+    A real 5 kHz transmitter with standard 750 us pre-emphasis comes back
+    through the (inverse) de-emphasis at the full +-5000 Hz, so the
+    discriminator scale must track the deviation setting.
+    """
+    audio = tone(1900.0, 2.0, amp=1.0)   # full-scale drive
+    iq = make_iq(audio, T0, doppler_fn, dev=5000.0)
+
+    def run(deviation_hz, deemphasis=False):
+        chain = ReceiveChain(deviation_hz=deviation_hz, deemphasis=deemphasis,
+                             doppler_segment=lambda t0, t1, n: doppler_fn(
+                                 np.linspace(t0, t1, n)))
+        out = []
+        for i in range(0, len(iq), 24_000):
+            out.append(chain.process(iq[i:i + 24_000], T0 + i / FS_IQ))
+        return np.concatenate(out)
+
+    sa = StreamingAnalytic(FS_AUDIO)
+    out = run(5000.0)
+    peak = np.max(np.abs(out))
+    sat_frac = float(np.mean(np.abs(out) > 0.999))
+    assert 0.85 < peak <= 1.0, f"peak {peak:.3f}, expected ~full scale"
+    assert sat_frac < 0.001, f"{sat_frac:.2%} of samples hard-clipped"
+    frame = sa.process(out)
+    mid = frame.freq[int(0.2 * FS_AUDIO):int(1.8 * FS_AUDIO)]
+    assert abs(np.median(mid) - 1900.0) < 25.0
+
+    # regression guard: the old fixed 4 kHz scale mangles the same signal
+    legacy = run(4000.0)
+    legacy_sat = float(np.mean(np.abs(legacy) > 0.999))
+    assert legacy_sat > 0.2, "legacy 4 kHz scale should visibly clip 5 kHz"
+
+
+def test_sstv_image_70cm_5khz_deviation():
+    """70 cm-style downlink: 3x doppler swing (~+-10.8 kHz) and 5 kHz FM
+    deviation decode to the same quality as the 2 m reference path."""
+    img = test_image()
+    audio = encode_robot36(img, FS_IQ, amplitude=0.8).astype(np.float64)
+    pre = Preemphasis(FS_IQ)
+    audio_pe = pre.process(audio)
+    # normalize so the FM deviation peaks at the full 5 kHz
+    audio_pe = audio_pe / np.max(np.abs(audio_pe))
+
+    def doppler_70(t):
+        """3x the 2 m doppler profile: ISS LEO doppler at 437.55 MHz."""
+        return 10_800.0 * np.sin(2.0 * np.pi * (np.asarray(t, float) - T0) / 300.0)
+
+    iq = make_iq(audio_pe, T0, doppler_70, dev=5000.0, noise_sigma=0.22)
+
+    chain = ReceiveChain(
+        deviation_hz=5000.0,
+        doppler_segment=lambda t0, t1, n: doppler_70(np.linspace(t0, t1, n)))
+    events = []
+    eng = SSTVEngine(FS_AUDIO, on_event=events.append)
+    chunk = 24_000
+    for i in range(0, len(iq), chunk):
+        t = T0 + i / FS_IQ
+        eng.process(chain.process(iq[i:i + chunk], t))
+    eng.flush()
+
+    comps = [e for e in events if e.type == EventType.IMAGE_COMPLETE]
+    assert len(comps) == 1
+    comp = comps[0]
+    assert not comp.truncated
+    assert comp.sync_quality >= 0.99
+    y_orig = img.mean(axis=2)
+    y_dec = comp.image.mean(axis=2)
+    err = np.abs(y_dec - y_orig)
+    assert err.mean() < 12.0
+    assert np.corrcoef(y_orig.ravel(), y_dec.ravel())[0, 1] > 0.93
+
+
 def test_sstv_image_through_rf_chain():
     """End-to-end: encoded SSTV -> preemphasis -> FM+doppler+noise -> chain
     -> audio -> SSTV engine -> decoded image."""

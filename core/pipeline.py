@@ -187,6 +187,7 @@ class PassPipeline(QObject):
                 self.tracker, self.pass_info,
                 freq_hz=s.nominal_freq_hz,
                 tuning_offset_hz=s.tuning_offset_hz,
+                deviation_hz=s.fm_deviation_hz,
                 snr_db=s.sim_snr_db,
                 speed=s.sim_speed,
                 preroll_s=0.0, postroll_s=0.0,
@@ -226,6 +227,7 @@ class PassPipeline(QObject):
             fine_offset_hz=s.fine_offset_hz,
             deemphasis=s.deemphasis,
             channel_bw_hz=s.channel_bw_hz,
+            deviation_hz=s.fm_deviation_hz,
             doppler_segment=segment)
 
     # ------------------------------------------------------------------

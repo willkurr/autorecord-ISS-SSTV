@@ -27,9 +27,11 @@ live as they come down, and files everything away for later review.
   the travelled portion highlighted and the live position marked.
 - **Software doppler correction** – the dongle stays parked at a fixed
   frequency; a per-sample numerically-controlled oscillator removes the
-  predicted doppler shift (up to ±3.6 kHz at 145.8 MHz) glitch-free,
-  which matters for SSTV.  The effective tuned frequency is displayed
-  live.
+  predicted doppler shift (up to ±3.6 kHz at 145.8 MHz, ±10.8 kHz on the
+  70 cm downlink at 437.55 MHz) glitch-free, which matters for SSTV.  The
+  effective tuned frequency is displayed live.  The FM deviation setting
+  (ISS SSTV: 5 kHz) scales the recovered audio to full range without
+  clipping.
 - **Pass recording** – the doppler-corrected FM audio of the whole pass is
   written to a 48 kHz WAV as it arrives, with a JSON sidecar holding the
   TLE used, station coordinates, radio settings and the images decoded.
@@ -104,8 +106,10 @@ python main.py demo           # headless simulated pass, decoded end-to-end
 2. Click **Track & record selected pass** – the pass is armed, the sky map
    shows its track, and with *Auto-record* enabled the receiver starts by
    itself before AOS.
-3. **Settings → Radio** – set the downlink frequency (ISS SSTV: 
-   **145.800 MHz FM**), your dongle's PPM error if known, and the gain.
+3. **Settings → Radio** – set the downlink frequency, your dongle's PPM
+   error if known, and the gain.  The classic ISS SSTV frequency is
+   **145.800 MHz FM**; newer events have used the 70 cm band at
+   **437.550 MHz FM** (same 5 kHz deviation, about 3x the doppler swing).
 4. When the pass begins the waterfall shows the signal, doppler is
    corrected continuously, and any SSTV transmission opens a live decode
    card.  Images land in the **Images** tab automatically.
@@ -114,10 +118,14 @@ python main.py demo           # headless simulated pass, decoded end-to-end
 
 ### Calibrating frequency error
 
-The RTL-SDR's crystal error (PPM) shifts everything.  Set your dongle's
-PPM in Settings → Radio (measure it against a known-strong station), and
-use *Fine offset* for sub-PPM residuals: a 1 ppm error at 145.8 MHz is
-146 Hz, which would tint decoded images by ~46 grey levels.
+The RTL-SDR's crystal error (PPM) shifts everything, and the absolute
+error scales with frequency: set your dongle's PPM in Settings → Radio
+(measure it against a known-strong station), and use *Fine offset* for
+sub-PPM residuals.  Recalibrate when you switch bands - a 1 ppm error is
+146 Hz at 145.8 MHz but 437 Hz at 437.55 MHz, which would tint decoded
+images.  The *FM deviation* setting should match the transmitter (ISS
+SSTV: 5 kHz); the recovered audio is normalized to it, so a mismatch
+either clips loud passages or wastes dynamic range.
 
 ### Troubleshooting the dongle
 

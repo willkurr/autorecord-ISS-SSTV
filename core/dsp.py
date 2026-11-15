@@ -11,7 +11,7 @@ free, unlike periodic hardware retuning.
 Signal flow (fs_iq = 240 kHz, fs_audio = 48 kHz):
 
     IQ --NCO(offset+doppler)--> complex LPF 15 kHz --> /5 --> FM disc -->
-    DC block --> de-emphasis (optional) --> normalized float audio
+    DC block --> de-emphasis (optional) --> normalize by FM deviation
 """
 from __future__ import annotations
 
@@ -27,7 +27,8 @@ FS_IQ = 240_000        # RTL-SDR sample rate (240 kHz keeps a 5:1 ratio to audio
 FS_AUDIO = 48_000
 CHANNEL_BW_HZ = 15_000  # complex low-pass cutoff around DC
 CHANNEL_TAPS = 127
-DISC_SCALE_HZ = 4_000.0  # discriminator Hz that maps to full-scale audio
+DISC_SCALE_HZ = 4_000.0  # legacy default: discriminator Hz -> full-scale audio
+                         # (superseded by the per-source fm_deviation_hz setting)
 DC_BLOCK_HZ = 250.0
 DEEMPH_TAU_S = 750e-6    # standard narrow-FM de-emphasis time constant
 
@@ -91,6 +92,7 @@ class ReceiveChain:
                  fine_offset_hz: float = 0.0,
                  deemphasis: bool = True,
                  channel_bw_hz: float = CHANNEL_BW_HZ,
+                 deviation_hz: float = DISC_SCALE_HZ,
                  doppler_segment: Optional[Callable[[float, float, int], np.ndarray]] = None):
         self.fs_iq = float(fs_iq)
         self.fs_audio = float(fs_audio)
@@ -98,6 +100,11 @@ class ReceiveChain:
         self.tuning_offset_hz = float(tuning_offset_hz)
         self.fine_offset_hz = float(fine_offset_hz)
         self.deemphasis = deemphasis
+        # The discriminator output (Hz) is normalized by the downlink's peak
+        # FM deviation, so a full-deviation signal lands at full-scale audio
+        # without clipping.  ISS SSTV uses ~5 kHz deviation on both the 2 m
+        # and 70 cm downlinks.
+        self.deviation_hz = float(deviation_hz)
         self.doppler_segment = doppler_segment
 
         self._taps = firwin(CHANNEL_TAPS, channel_bw_hz, fs=self.fs_iq)
@@ -164,5 +171,5 @@ class ReceiveChain:
         audio = audio_hz - self._dc_lp.process(audio_hz)
         if self.deemphasis:
             audio = self._deemph_lp.process(audio)
-        audio = np.clip(audio / DISC_SCALE_HZ, -1.0, 1.0)
+        audio = np.clip(audio / self.deviation_hz, -1.0, 1.0)
         return audio.astype(np.float32)
